@@ -14,9 +14,17 @@ better-exceptions = "^0.3.3"
 pyotp = "^2.8.0"
 uvicorn = "^0.22.0"
 loguru = "^0.7.0"
+pyyaml = "^6.0"
 
 [tool.poetry.group.dev.dependencies]
 poetry = "^1.4.2"
+
+
+[[tool.poetry.source]]
+name = "default"
+url = "https://pypi.org"
+default = false
+secondary = false
 
 [build-system]
 requires = ["poetry-core"]

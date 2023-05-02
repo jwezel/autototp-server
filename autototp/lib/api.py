@@ -1,73 +1,110 @@
-import better_exceptions
-
-better_exceptions.hook()
-
+from datetime import datetime
 from typing import Optional
 from uuid import uuid4
 
-from fastapi import Header
-from pydantic import BaseModel
+from fastapi import Header, HTTPException, Response
+from pydantic import UUID4, BaseModel, Field
 from pyotp import TOTP
 
 from .app import app
-from .db import db
+from .db import create, db
 from .util import logged, logger
 
 
-class InputBody(BaseModel):
-    token: str
+class DatabaseModel(BaseModel):
+    id: UUID4 = Field(default_factory=lambda: uuid4())
+    created: datetime = Field(default_factory=datetime.now)
+
+
+class Input(DatabaseModel):
+    userId: UUID4
+    url: Optional[str]  # In /api/v1/input not passed in body but in header Origin
     field: str
     secret: Optional[str]
 
 
+class InputBody(BaseModel):
+    user: str
+    field: str
+    secret: Optional[str]
+
+
+class InputResponse(BaseModel):
+    code: Optional[str] = Field(default=None)
+
+
 @app.post('/api/v1/input')
-async def post_input(input: InputBody, origin: str = Header()):
-    result = {}
-    logger.debug(input)
+async def post_input(input: Input, origin: str = Header()) -> InputResponse:
+    result = InputResponse()
     with db as conn:
-        if input.secret:
-            conn.execute(
-                'Insert Into Input (id, tokenId, url, field, secret) Values(?, ?, ?, ?, ?)',
-                logged('Input created', (uuid4().hex, input.token, origin, input.field, input.secret)),
-            )
-            secret = input.secret
+        secrets = conn.execute(
+            '''
+            Select
+                I.secret
+            From
+                User U Left Join Input I On U.id = I.userId
+            Where
+                url = :url And
+                field = :field And
+                U.id = :userId
+            Order By
+                I.created Desc
+            ''',
+            vars(input) | dict(url=origin),
+        )
+        secretRows = secrets.fetchone()
+        if secretRows and len(secretRows) > 0:
+            secret = logged('Secret fetched', secretRows)[0]
         else:
-            secrets = conn.execute(
-                '''
-                Select
-                    I.secret
-                From
-                    Token T Left Join Input I On T.id = I.tokenId
-                Where
-                    url = :url And field = :field And T.id = :token
-                Order By
-                    I.time Desc
-                ''',
-                vars(input) | dict(token=input.token, url=origin),
-            ).fetchone()
-            if secrets:
-                secret = logged('Secret fetched', secrets)[0]
-            else:
-                secret = None
+            logger.debug({'Input rows': secretRows})
+            secret = None
+        if input.secret and not secret:
+            input.url = origin
+            create(input)
+            secret = input.secret
         if secret:
-            otpgen = TOTP(secret)
-            result['code'] = otpgen.now()
+            try:
+                otpgen = TOTP(secret)
+                result.code = otpgen.now()
+            except BaseException as e:
+                raise HTTPException(status_code=400, detail=f'TOTP secret: {e}')
         return logged('Returned', result)
 
 
-@app.post('/api/v1/user/create')
-async def post_user_create():
-    with db as conn:
-        conn.execute(
-            'Insert Into Token (id) Values(?)',
-            logged('User created', (uuid4().hex,)),
-        )
+class User(DatabaseModel):
+    name: str
 
 
-@app.post('/api/v1/user/delete')
-async def post_user_delete(token: str):
+class UserCreateRequestBody(BaseModel):
+    name: str
+
+
+@app.post('/api/v1/user')
+async def post_user(user: User, apiResponse: Response) -> User:
     with db as conn:
+        userDict = user.dict()
         conn.execute(
-            'Delete From Token Where id = ?',
-            logged('User deleted', (token,)),
+            f"""
+            Insert
+            Into User ({', '.join(f"{n}" for n in userDict.keys())})
+            Values ({', '.join(f":{n}" for n in userDict.keys())})
+            """,
+            logged('User created', userDict),
         )
+    apiResponse.status_code = 201
+    return user
+
+
+class UserDeleteRequestBody(BaseModel):
+    id: UUID4
+
+
+@app.delete('/api/v1/user')
+async def delete_user(body: UserDeleteRequestBody):
+    with db as conn:
+        cursor = conn.execute(
+            'Delete From User Where id = :id',
+            logged('User deleted', body.dict()),
+        )
+        if cursor.rowcount < 1:
+            raise HTTPException(404, "Not found")
